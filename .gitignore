@@ -1,0 +1,23 @@
+# Local build and test output
+*.zip
+.cfn-lint-cache/
+cfn-lint.log
+out/
+tmp/
+.env
+*.pem
+
+# Editor and OS
+.vscode/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+
+# draw.io backups
+*.drawio.bkp
+.$*.drawio*
+
+# Working notes, not for publishing
+docs/PLAN.md
+docs/original-draft.txt

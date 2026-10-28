@@ -1,0 +1,420 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Centralized ingress VPC (owned by the networking team). Deploy once. Creates the
+  ingress VPC, subnets for the load balancer, the PrivateLink endpoints, and the
+  optional AWS Network Firewall, and publishes the values that application teams
+  and the per-application ingress stack read from AWS Systems Manager Parameter Store.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block of the ingress VPC. The workload VPC can use the same range.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+  AzId1:
+    Type: String
+    Default: usw2-az1
+    Description: First Availability Zone ID. Use AZ IDs, not names, because names map differently in each account.
+  AzId2:
+    Type: String
+    Default: usw2-az2
+    Description: Second Availability Zone ID.
+  EnableCloudFront:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      "true" keeps the load balancer subnets private (no route to the internet gateway) so
+      that a CloudFront VPC origin is the only way in. "false" makes them public.
+  EnableNetworkFirewall:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      "true" inspects the traffic between the ALB and the PrivateLink endpoints with AWS Network
+      Firewall (one firewall endpoint per Availability Zone). Network Firewall is billed per
+      endpoint-hour and per GB processed.
+  EnableLogging:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Send Network Firewall flow and alert logs to Amazon CloudWatch Logs (only used with the firewall).
+
+Conditions:
+  UseCloudFront: !Equals [!Ref EnableCloudFront, "true"]
+  PublicAlbSubnets: !Not [!Condition UseCloudFront]
+  UseFirewall: !Equals [!Ref EnableNetworkFirewall, "true"]
+  UseFirewallLogging: !And
+    - !Condition UseFirewall
+    - !Equals [!Ref EnableLogging, "true"]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ingress-vpc
+
+  # The internet gateway is required even when CloudFront VPC origins are used.
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Load balancer subnets
+  AlbSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId1
+      CidrBlock: !Select [0, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb-${AzId1}
+  AlbSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId2
+      CidrBlock: !Select [1, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb-${AzId2}
+
+  # PrivateLink interface endpoint subnets
+  EndpointSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId1
+      CidrBlock: !Select [2, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-endpoint-${AzId1}
+  EndpointSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId2
+      CidrBlock: !Select [3, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-endpoint-${AzId2}
+
+  # One route table per subnet keeps the inspection routes (added by the firewall
+  # section) independent per Availability Zone.
+  AlbRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb-${AzId1}
+  AlbRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb-${AzId2}
+  EndpointRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-endpoint-${AzId1}
+  EndpointRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-endpoint-${AzId2}
+
+  AlbSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AlbSubnet1
+      RouteTableId: !Ref AlbRouteTable1
+  AlbSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AlbSubnet2
+      RouteTableId: !Ref AlbRouteTable2
+  EndpointSubnet1Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref EndpointSubnet1
+      RouteTableId: !Ref EndpointRouteTable1
+  EndpointSubnet2Association:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref EndpointSubnet2
+      RouteTableId: !Ref EndpointRouteTable2
+
+  AlbDefaultRoute1:
+    Type: AWS::EC2::Route
+    Condition: PublicAlbSubnets
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref AlbRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  AlbDefaultRoute2:
+    Type: AWS::EC2::Route
+    Condition: PublicAlbSubnets
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref AlbRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # ---------------------------------------------------------------------------
+  # Optional: AWS Network Firewall between the ALB subnets and the endpoint subnets
+  # ---------------------------------------------------------------------------
+  # One firewall per Availability Zone, all sharing one policy. A single firewall with two
+  # subnets works too, but CloudFormation does not guarantee the order of its EndpointIds,
+  # which makes the per-AZ routes below ambiguous.
+  FirewallSubnet1:
+    Type: AWS::EC2::Subnet
+    Condition: UseFirewall
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId1
+      CidrBlock: !Select [0, !Cidr [!Select [4, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]], 2, 4]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-firewall-${AzId1}
+  FirewallSubnet2:
+    Type: AWS::EC2::Subnet
+    Condition: UseFirewall
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId2
+      CidrBlock: !Select [1, !Cidr [!Select [4, !Cidr [!GetAtt Vpc.CidrBlock, 8, 8]], 2, 4]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-firewall-${AzId2}
+
+  InspectionRuleGroup:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Condition: UseFirewall
+    Properties:
+      RuleGroupName: !Sub ${AWS::StackName}-http-inspection
+      Type: STATEFUL
+      Capacity: 100
+      RuleGroup:
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+        RulesSource:
+          # Strict order: rules run top to bottom and the policy default action drops
+          # whatever no rule passed. The reject rule must come before the pass rules.
+          RulesString: |
+            reject http any any -> any any (msg:"Blocked URI /blocked"; flow:to_server,established; http.uri; content:"/blocked"; startswith; sid:1000001; rev:1;)
+            pass tcp any any -> any any (flags:S; flow:to_server; msg:"TCP handshake"; sid:1000002; rev:1;)
+            pass tcp any any -> any any (flags:SA; flow:to_client; msg:"TCP handshake"; sid:1000003; rev:1;)
+            pass http any any -> any any (msg:"Allow HTTP"; flow:established; sid:1000004; rev:1;)
+
+  FirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Condition: UseFirewall
+    Properties:
+      FirewallPolicyName: !Sub ${AWS::StackName}-policy
+      FirewallPolicy:
+        StatelessDefaultActions: ["aws:forward_to_sfe"]
+        StatelessFragmentDefaultActions: ["aws:forward_to_sfe"]
+        StatefulEngineOptions:
+          RuleOrder: STRICT_ORDER
+        StatefulDefaultActions: ["aws:drop_established", "aws:alert_established"]
+        StatefulRuleGroupReferences:
+          # Active threat defense is on by default only for policies created in the console.
+          # In CloudFormation you add the managed rule group yourself.
+          - ResourceArn: !Sub arn:${AWS::Partition}:network-firewall:${AWS::Region}:aws-managed:stateful-rulegroup/AttackInfrastructureStrictOrder
+            Priority: 10
+          - ResourceArn: !GetAtt InspectionRuleGroup.RuleGroupArn
+            Priority: 20
+
+  Firewall1:
+    Type: AWS::NetworkFirewall::Firewall
+    Condition: UseFirewall
+    Properties:
+      FirewallName: !Sub ${AWS::StackName}-fw-${AzId1}
+      FirewallPolicyArn: !GetAtt FirewallPolicy.FirewallPolicyArn
+      VpcId: !Ref Vpc
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnet1
+  Firewall2:
+    Type: AWS::NetworkFirewall::Firewall
+    Condition: UseFirewall
+    Properties:
+      FirewallName: !Sub ${AWS::StackName}-fw-${AzId2}
+      FirewallPolicyArn: !GetAtt FirewallPolicy.FirewallPolicyArn
+      VpcId: !Ref Vpc
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnet2
+
+  # Traffic between the ALB subnet and the endpoint subnet of the same AZ is steered
+  # through that AZ's firewall endpoint in both directions (more specific than the local
+  # route). The ALB target group must not use cross-zone routing, otherwise the forward
+  # and return paths would cross two different firewalls.
+  AlbToEndpointRoute1:
+    Type: AWS::EC2::Route
+    Condition: UseFirewall
+    Properties:
+      RouteTableId: !Ref AlbRouteTable1
+      DestinationCidrBlock: !GetAtt EndpointSubnet1.CidrBlock
+      VpcEndpointId: !Select [1, !Split [":", !Select [0, !GetAtt Firewall1.EndpointIds]]]
+  AlbToEndpointRoute2:
+    Type: AWS::EC2::Route
+    Condition: UseFirewall
+    Properties:
+      RouteTableId: !Ref AlbRouteTable2
+      DestinationCidrBlock: !GetAtt EndpointSubnet2.CidrBlock
+      VpcEndpointId: !Select [1, !Split [":", !Select [0, !GetAtt Firewall2.EndpointIds]]]
+  EndpointToAlbRoute1:
+    Type: AWS::EC2::Route
+    Condition: UseFirewall
+    Properties:
+      RouteTableId: !Ref EndpointRouteTable1
+      DestinationCidrBlock: !GetAtt AlbSubnet1.CidrBlock
+      VpcEndpointId: !Select [1, !Split [":", !Select [0, !GetAtt Firewall1.EndpointIds]]]
+  EndpointToAlbRoute2:
+    Type: AWS::EC2::Route
+    Condition: UseFirewall
+    Properties:
+      RouteTableId: !Ref EndpointRouteTable2
+      DestinationCidrBlock: !GetAtt AlbSubnet2.CidrBlock
+      VpcEndpointId: !Select [1, !Split [":", !Select [0, !GetAtt Firewall2.EndpointIds]]]
+
+  FirewallFlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: UseFirewallLogging
+    Properties:
+      LogGroupName: !Sub /pattern/${AWS::StackName}/firewall-flow
+      RetentionInDays: 7
+  FirewallAlertLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: UseFirewallLogging
+    Properties:
+      LogGroupName: !Sub /pattern/${AWS::StackName}/firewall-alert
+      RetentionInDays: 7
+  FirewallLogging1:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Condition: UseFirewallLogging
+    Properties:
+      FirewallArn: !Ref Firewall1
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallFlowLogGroup
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallAlertLogGroup
+  FirewallLogging2:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Condition: UseFirewallLogging
+    DependsOn: FirewallLogging1
+    Properties:
+      FirewallArn: !Ref Firewall2
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallFlowLogGroup
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Ref FirewallAlertLogGroup
+
+  # Values published for the other stacks. Application teams read these through
+  # CloudFormation parameters of type AWS::SSM::Parameter::Value<String>.
+  ParamPrincipalArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/principal-arn
+      Type: String
+      Value: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+      Description: Principal allowed to connect to the workload endpoint services.
+  ParamAzId1:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/az-id-1
+      Type: String
+      Value: !Ref AzId1
+  ParamAzId2:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/az-id-2
+      Type: String
+      Value: !Ref AzId2
+  ParamCloudFrontEnabled:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/cloudfront-enabled
+      Type: String
+      Value: !Ref EnableCloudFront
+  ParamInspectionEnabled:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/inspection-enabled
+      Type: String
+      Value: !Ref EnableNetworkFirewall
+  ParamVpcId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/vpc-id
+      Type: String
+      Value: !Ref Vpc
+  ParamVpcCidr:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/vpc-cidr
+      Type: String
+      Value: !GetAtt Vpc.CidrBlock
+  ParamAlbSubnetIds:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/alb-subnet-ids
+      Type: StringList
+      Value: !Join [",", [!Ref AlbSubnet1, !Ref AlbSubnet2]]
+  ParamAlbSubnetCidrs:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/alb-subnet-cidrs
+      Type: StringList
+      Value: !Join [",", [!GetAtt AlbSubnet1.CidrBlock, !GetAtt AlbSubnet2.CidrBlock]]
+  ParamEndpointSubnetIds:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /pattern/ingress/endpoint-subnet-ids
+      Type: StringList
+      Value: !Join [",", [!Ref EndpointSubnet1, !Ref EndpointSubnet2]]
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+  AlbSubnetIds:
+    Value: !Join [",", [!Ref AlbSubnet1, !Ref AlbSubnet2]]
+  EndpointSubnetIds:
+    Value: !Join [",", [!Ref EndpointSubnet1, !Ref EndpointSubnet2]]

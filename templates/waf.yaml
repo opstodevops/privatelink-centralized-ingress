@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AWS WAF web ACL for the shared ingress (owned by the networking team). Deploy with
+  Scope=CLOUDFRONT in us-east-1 to protect CloudFront distributions, and/or with
+  Scope=REGIONAL in the ingress Region to protect Application Load Balancers.
+  Pass the WebAclArn output to ingress-app.yaml.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  Scope:
+    Type: String
+    Default: REGIONAL
+    AllowedValues: [REGIONAL, CLOUDFRONT]
+    Description: CLOUDFRONT web ACLs can only be created in us-east-1.
+  BlockedUserAgent:
+    Type: String
+    Default: badbot
+    Description: Requests whose User-Agent header contains this text are blocked (a visible test rule).
+  RateLimit:
+    Type: Number
+    Default: 1000
+    MinValue: 10
+    Description: Maximum requests from one IP address in a 5-minute window.
+  EnableLogging:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Send web ACL logs to Amazon CloudWatch Logs.
+
+Conditions:
+  LoggingOn: !Equals [!Ref EnableLogging, "true"]
+
+Resources:
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${AWS::StackName}-web-acl
+      Scope: !Ref Scope
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${AWS::StackName}-web-acl
+      Rules:
+        - Name: block-user-agent
+          Priority: 0
+          Action:
+            Block:
+              CustomResponse:
+                ResponseCode: 403
+          Statement:
+            ByteMatchStatement:
+              SearchString: !Ref BlockedUserAgent
+              FieldToMatch:
+                SingleHeader:
+                  Name: user-agent
+              TextTransformations:
+                - Priority: 0
+                  Type: LOWERCASE
+              PositionalConstraint: CONTAINS
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: block-user-agent
+        - Name: rate-limit-per-ip
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimit
+              EvaluationWindowSec: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit-per-ip
+        - Name: aws-common-rule-set
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-common-rule-set
+
+  # The log group name must start with aws-waf-logs-
+  WafLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: LoggingOn
+    Properties:
+      LogGroupName: !Sub aws-waf-logs-${AWS::StackName}
+      RetentionInDays: 7
+
+  WafLogging:
+    Type: AWS::WAFv2::LoggingConfiguration
+    Condition: LoggingOn
+    Properties:
+      ResourceArn: !GetAtt WebAcl.Arn
+      LogDestinationConfigs:
+        - !GetAtt WafLogGroup.Arn
+
+Outputs:
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn

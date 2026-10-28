@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Isolated workload VPC (owned by the application team). Deploy once per application.
+  Creates a VPC with no internet gateway and no NAT gateway, a stub web application,
+  a Network Load Balancer, and a PrivateLink endpoint service that only the ingress
+  account can connect to. Reads its inputs from /pattern/ingress/* in Parameter Store
+  and publishes the endpoint service name to /pattern/apps/<AppName>/.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+
+Parameters:
+  AppName:
+    Type: String
+    Default: app1
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+    Description: Short application name. Used in resource names and in the Parameter Store path.
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >-
+      Workload VPC CIDR. The default is identical to the ingress VPC on purpose, to show
+      that PrivateLink works with overlapping ranges.
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+  InstanceType:
+    Type: String
+    Default: t4g.nano
+    Description: Instance type of the stub application (Arm-based, to match the AMI parameter).
+  # Values published by ingress-core.yaml
+  IngressPrincipalArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pattern/ingress/principal-arn
+  AzId1:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pattern/ingress/az-id-1
+  AzId2:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /pattern/ingress/az-id-2
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-workload-vpc
+
+  # No internet gateway, no NAT gateway, no default route: the VPC cannot reach the internet.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId1
+      CidrBlock: !Select [0, !Cidr [!GetAtt Vpc.CidrBlock, 4, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-private-${AzId1}
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZoneId: !Ref AzId2
+      CidrBlock: !Select [1, !Cidr [!GetAtt Vpc.CidrBlock, 4, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-private-${AzId2}
+
+  NlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Network Load Balancer of the endpoint service
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref VpcCidr
+          Description: Health checks and in-VPC traffic. PrivateLink traffic is not evaluated against this group.
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-nlb
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Stub application instance
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref NlbSecurityGroup
+          Description: HTTP from the Network Load Balancer only
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-app
+
+  AppStubInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PrivateSubnet1
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-stub
+      # The VPC has no internet access, so the instance installs nothing. Amazon Linux 2023
+      # ships with Python 3, which is all the stub needs.
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          mkdir -p /opt/stub
+          cat > /opt/stub/app.py <<'PYEOF'
+          import json, socket, urllib.request
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          APP = "${AppName}"
+
+          def imds(path):
+              token_req = urllib.request.Request(
+                  "http://169.254.169.254/latest/api/token", method="PUT",
+                  headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+              token = urllib.request.urlopen(token_req, timeout=2).read().decode()
+              req = urllib.request.Request(
+                  "http://169.254.169.254/latest/meta-data/" + path,
+                  headers={"X-aws-ec2-metadata-token": token})
+              return urllib.request.urlopen(req, timeout=2).read().decode()
+
+          def outbound_blocked():
+              try:
+                  socket.create_connection(("1.1.1.1", 443), timeout=2).close()
+                  return False
+              except OSError:
+                  return True
+
+          class Handler(BaseHTTPRequestHandler):
+              timeout = 10  # drop idle connections so they cannot pile up
+
+              def do_GET(self):
+                  if self.path == "/health":
+                      self.send_response(200); self.end_headers(); self.wfile.write(b"ok"); return
+                  h = self.headers
+                  body = {
+                      "app": APP,
+                      "served_by": {"instance_id": imds("instance-id"),
+                                    "az": imds("placement/availability-zone"),
+                                    "private_ip": imds("local-ipv4")},
+                      "client_source_ip_seen_by_app": self.client_address[0],
+                      "via_cloudfront": "X-Amz-Cf-Id" in h,
+                      "x_forwarded_for": h.get("X-Forwarded-For"),
+                      "host": h.get("Host"),
+                      "outbound_internet_blocked": outbound_blocked(),
+                  }
+                  data = (json.dumps(body, indent=2) + "\n").encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+              def log_message(self, *args):
+                  pass
+
+          # Threaded: load balancers open idle connections, which would block a single-threaded server.
+          ThreadingHTTPServer(("0.0.0.0", 80), Handler).serve_forever()
+          PYEOF
+          cat > /etc/systemd/system/stub.service <<'SVCEOF'
+          [Unit]
+          Description=Stub application
+          After=network-online.target
+          [Service]
+          ExecStart=/usr/bin/python3 /opt/stub/app.py
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+          SVCEOF
+          systemctl daemon-reload
+          systemctl enable --now stub.service
+
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internal
+      Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroups: [!Ref NlbSecurityGroup]
+      EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic: "off"
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: "true"
+      Tags:
+        - Key: Name
+          Value: !Sub ${AppName}-nlb
+
+  NlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: TCP
+      Port: 80
+      TargetType: instance
+      Targets:
+        - Id: !Ref AppStubInstance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health
+      TargetGroupAttributes:
+        - Key: preserve_client_ip.enabled
+          Value: "false"
+
+  NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Nlb
+      Protocol: TCP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NlbTargetGroup
+
+  EndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      NetworkLoadBalancerArns: [!Ref Nlb]
+      # Access is controlled by the allowed principal below, so connections need no manual approval.
+      AcceptanceRequired: false
+
+  EndpointServicePermissions:
+    Type: AWS::EC2::VPCEndpointServicePermissions
+    Properties:
+      ServiceId: !Ref EndpointService
+      AllowedPrincipals:
+        - !Ref IngressPrincipalArn
+
+  ParamEndpointServiceName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub /pattern/apps/${AppName}/endpoint-service-name
+      Type: String
+      Value: !Sub com.amazonaws.vpce.${AWS::Region}.${EndpointService}
+      Description: PrivateLink endpoint service name that the ingress stack connects to.
+
+Outputs:
+  EndpointServiceName:
+    Value: !Sub com.amazonaws.vpce.${AWS::Region}.${EndpointService}
+  NlbArn:
+    Value: !Ref Nlb
